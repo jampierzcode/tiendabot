@@ -14,13 +14,31 @@ const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 120000)
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './.sessions'
 // Navegadores precargados en espera (sin sesión guardada): cada uno cuesta
 // ~200 MB de RAM, pero «Conectar» muestra el QR al instante.
-const PRELOAD_MAX = Number(process.env.PRELOAD_MAX ?? 2)
+const PRELOAD_MAX = Number(
+  process.env.PRELOAD_MAX ?? (process.env.NODE_ENV === 'production' ? 0 : 2)
+)
+// Sondeo adaptativo: rápido solo cuando algo está cambiando (QR, conectando).
+const SESSIONS_IDLE_MS = Number(process.env.SESSIONS_IDLE_MS || 6000)
 const USER_AGENT =
   process.env.WA_USER_AGENT ||
   'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
 
 /** businessUuid -> { client, status } */
 const clients = new Map()
+
+/**
+ * Fallos al abrir el navegador, por sesión. Sin esto un Chromium que no puede
+ * arrancar se reintenta cada 2 s para siempre (y por cada negocio que alguna
+ * vez abrió la pantalla de WhatsApp). Espera 15 s, 30 s, 60 s… hasta 10 min.
+ */
+const fallos = new Map() // uuid -> { n, hasta }
+function registrarFallo(uuid) {
+  const n = (fallos.get(uuid)?.n ?? 0) + 1
+  const espera = Math.min(15000 * 2 ** (n - 1), 10 * 60 * 1000)
+  fallos.set(uuid, { n, hasta: Date.now() + espera })
+  log(uuid, `reintento en ${Math.round(espera / 1000)} s (fallo ${n})`)
+}
+const enEspera = (uuid) => (fallos.get(uuid)?.hasta ?? 0) > Date.now()
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
 const log = (...a) => console.log(new Date().toISOString(), ...a)
@@ -67,6 +85,7 @@ function levantar(uuid, standby = false) {
 
   client.on('ready', async () => {
     entry.status = 'connected'
+    fallos.delete(uuid)
     const phone = client.info?.wid?.user ?? null
     log(uuid, 'conectado', phone)
     await report(uuid, { status: 'connected', connectedPhone: phone })
@@ -74,6 +93,7 @@ function levantar(uuid, standby = false) {
 
   client.on('auth_failure', async (m) => {
     log(uuid, 'fallo de autenticación', m)
+    registrarFallo(uuid)
     await apagar(uuid)
   })
 
@@ -132,7 +152,8 @@ function levantar(uuid, standby = false) {
   })
 
   client.initialize().catch(async (e) => {
-    log(uuid, 'no pudo iniciar', e.message)
+    log(uuid, 'no pudo iniciar', e.message.split('\n')[0])
+    registrarFallo(uuid)
     await apagar(uuid)
   })
 }
@@ -145,14 +166,23 @@ async function apagar(uuid) {
       await entry.client.destroy()
     } catch {}
   }
-  await report(uuid, { status: 'disconnected' })
+  // Un navegador precargado nadie lo pidió: su fallo no es noticia para el panel.
+  if (!entry?.standby) await report(uuid, { status: 'disconnected' })
 }
+
+// ¿Hay algo cambiando? Decide si el siguiente sondeo es rápido o tranquilo.
+let hayActividad = true
 
 async function sincronizarSesiones() {
   try {
     const sesiones = await api.sessions()
+    let actividad = false
     for (const s of sesiones) {
       if (!s.businessUuid) continue
+
+      // El panel pone «connecting» al pulsar Conectar/Reintentar: eso cancela la espera.
+      if (s.status === 'connecting' && !clients.has(s.businessUuid)) fallos.delete(s.businessUuid)
+      if (s.status === 'connecting' || s.status === 'qr') actividad = true
 
       // Vigilante: restaurar una sesión guardada a veces se queda colgado sin
       // error ni QR. Pasados 2 minutos sin conectar se descarta y se reintenta
@@ -163,7 +193,10 @@ async function sincronizarSesiones() {
         await apagar(s.businessUuid)
         continue
       }
-      if (s.desired === 'connected' && !clients.has(s.businessUuid)) levantar(s.businessUuid)
+      if (s.desired === 'connected' && !clients.has(s.businessUuid) && !enEspera(s.businessUuid)) {
+        levantar(s.businessUuid)
+        actividad = true
+      }
 
       // Alguien pidió conectar y ya había un navegador precargado: se entrega
       // el QR que tiene guardado en vez de arrancar de cero.
@@ -180,6 +213,7 @@ async function sincronizarSesiones() {
       if (
         s.desired === 'disconnected' &&
         !clients.has(s.businessUuid) &&
+        !enEspera(s.businessUuid) &&
         [...clients.values()].filter((c) => c.standby).length < PRELOAD_MAX &&
         !existsSync(join(SESSIONS_DIR, `session-${s.businessUuid}`))
       ) {
@@ -195,9 +229,15 @@ async function sincronizarSesiones() {
         await apagar(s.businessUuid)
       }
     }
+    hayActividad = actividad || [...clients.values()].some((c) => c.status === 'connecting' && !c.standby)
   } catch (e) {
     log('sync sesiones:', e.message)
   }
+}
+
+async function cicloSesiones() {
+  await sincronizarSesiones()
+  setTimeout(cicloSesiones, hayActividad ? SESSIONS_POLL_MS : SESSIONS_IDLE_MS)
 }
 
 let enviando = false
@@ -253,9 +293,8 @@ process.on('uncaughtException', (error) => {
 })
 
 log('bot iniciado')
-setInterval(sincronizarSesiones, SESSIONS_POLL_MS)
 setInterval(vaciarCola, OUTBOX_POLL_MS)
-sincronizarSesiones()
+cicloSesiones()
 
 process.on('SIGINT', async () => {
   for (const uuid of [...clients.keys()]) {
