@@ -43,7 +43,14 @@ function levantar(uuid, standby = false) {
     userAgent: USER_AGENT,
     puppeteer: {
       headless: true,
-      args: ['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage'],
+      // En el contenedor se usa el Chromium del sistema (ver Dockerfile).
+      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-gpu',
+      ],
     },
   })
 
