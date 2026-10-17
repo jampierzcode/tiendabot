@@ -264,7 +264,9 @@ async function vaciarCola() {
         const numero = await entry.client.getNumberId(m.phone).catch(() => null)
         const destino = numero?._serialized ?? (m.phone.length > 13 ? `${m.phone}@lid` : null)
         if (!destino) throw new Error('el número no tiene WhatsApp')
-        await entry.client.sendMessage(destino, m.body)
+        // sendSeen:false evita marcar el chat como leído al enviar: esa llamada interna
+        // (getChat) falla en algunas versiones de WhatsApp Web y tumbaba el envío.
+        await entry.client.sendMessage(destino, m.body, { sendSeen: false })
         await api.result(m.id, true)
         log(m.businessUuid, 'enviado', m.id)
       } catch (e) {
