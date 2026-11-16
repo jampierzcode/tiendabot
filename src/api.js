@@ -7,7 +7,11 @@ async function call(path, { method = 'GET', body } = {}) {
     headers: { 'content-type': 'application/json', 'x-bot-key': KEY },
     body: body ? JSON.stringify(body) : undefined,
   })
-  if (!res.ok) throw new Error(`${method} ${path} -> ${res.status}`)
+  if (!res.ok) {
+    // El cuerpo dice el porqué (p. ej. el mensaje de error del backend).
+    const detalle = (await res.text().catch(() => '')).slice(0, 300)
+    throw new Error(`${method} ${path} -> ${res.status} ${detalle}`)
+  }
   return res.json()
 }
 

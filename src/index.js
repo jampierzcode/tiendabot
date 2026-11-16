@@ -271,7 +271,8 @@ async function mensajeDelDueno(uuid, sock, m, leido) {
 
 async function levantar(uuid) {
   if (clients.has(uuid)) return
-  const entry = { sock: null, status: 'connecting', since: Date.now(), cerrando: false }
+  // conectadoEn: segundos epoch; lo anterior a la conexión es historial, no se responde.
+  const entry = { sock: null, status: 'connecting', since: Date.now(), cerrando: false, conectadoEn: Infinity }
   clients.set(uuid, entry)
 
   try {
@@ -304,6 +305,7 @@ async function levantar(uuid) {
 
       if (u.connection === 'open') {
         entry.status = 'connected'
+        entry.conectadoEn = Math.floor(Date.now() / 1000)
         fallos.delete(uuid)
         const phone = jidDecode(sock.user?.id ?? '')?.user ?? null
         log(uuid, 'conectado', phone)
@@ -353,6 +355,9 @@ async function levantar(uuid) {
       for (const m of messages) {
         const jid = m.key?.remoteJid
         if (!esChatDirecto(jid) || !m.message) continue
+        // Al conectar, WhatsApp reenvía mensajes recientes (incluidos los que el
+        // dueño escribió antes): no son conversación nueva. 30 s de margen por relojes.
+        if (Number(m.messageTimestamp ?? 0) < entry.conectadoEn - 30) continue
         const leido = leerMensaje(m)
         if (m.key.fromMe) {
           await mensajeDelDueno(uuid, sock, m, leido)
