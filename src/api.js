@@ -21,8 +21,8 @@ export const api = {
   claim: (limit = 10) => call('/outbox/claim', { method: 'POST', body: { limit } }).then((r) => r.data),
   result: (id, ok, error, requeue = false) =>
     call(`/outbox/${id}/result`, { method: 'POST', body: { ok, error, requeue } }),
-  inbound: (businessUuid, phone, text, kind = 'chat') =>
-    call('/inbound', { method: 'POST', body: { businessUuid, phone, text, kind } }),
+  inbound: (businessUuid, phone, text, kind = 'chat', images = []) =>
+    call('/inbound', { method: 'POST', body: { businessUuid, phone, text, kind, images } }),
   ownerMessage: (businessUuid, phone, text) =>
     call('/owner-message', { method: 'POST', body: { businessUuid, phone, text } }),
 }

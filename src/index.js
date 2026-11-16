@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import makeWASocket, {
   Browsers,
   DisconnectReason,
+  downloadMediaMessage,
   fetchLatestBaileysVersion,
   getContentType,
   isJidBroadcast,
@@ -227,23 +228,45 @@ async function atender(uuid, lote) {
       await sock.sendPresenceUpdate('composing', jid)
     } catch {}
 
-    const r = await api.inbound(uuid, telefono, textos.join('\n'), noTexto?.kind || 'chat')
+    // Fotos que mandó el cliente: se descargan para que el asistente las vea.
+    const imagenes = []
+    for (const x of lote.filter((x) => x.kind === 'image').slice(-3)) {
+      try {
+        const buf = await downloadMediaMessage(x.m, 'buffer', {}, { logger, reuploadRequest: sock.updateMediaMessage })
+        if (buf.length > 6 * 1024 * 1024) continue
+        const mime = normalizeMessageContent(x.m.message)?.imageMessage?.mimetype?.split(';')[0] || 'image/jpeg'
+        imagenes.push({ mime, data: buf.toString('base64') })
+      } catch (e) {
+        log(uuid, 'no pude descargar la foto del cliente', e.message)
+      }
+    }
 
-    for (const f of r?.media || []) {
+    const r = await api.inbound(uuid, telefono, textos.join('\n'), noTexto?.kind || 'chat', imagenes)
+    const fotos = r?.media || []
+    let reply = r?.reply || null
+
+    if (reply) {
+      // Pausa proporcional al largo: parece alguien escribiendo, no una máquina.
+      await sleep(Math.min(4000, 700 + reply.length * 15) + Math.random() * 800)
+    }
+
+    // Foto + texto en UN mensaje: la respuesta va como descripción de la
+    // última foto (WhatsApp corta descripciones muy largas: ahí van aparte).
+    for (const [i, f] of fotos.entries()) {
+      const ultima = i === fotos.length - 1
+      const juntar = ultima && reply && reply.length <= 1000
       try {
         const url = /^https?:\/\//.test(f.url) ? f.url : `${API_URL}${f.url}`
-        await enviar(uuid, sock, jid, { image: { url }, caption: f.caption })
-        await sleep(600 + Math.random() * 600)
+        await enviar(uuid, sock, jid, { image: { url }, caption: juntar ? reply : f.caption })
+        if (juntar) reply = null
+        if (!ultima) await sleep(600 + Math.random() * 600)
       } catch (e) {
+        // Si la foto no se pudo mandar, el texto igual sale (abajo).
         log(uuid, 'no pude enviar foto', e.message)
       }
     }
 
-    if (r?.reply) {
-      // Pausa proporcional al largo: parece alguien escribiendo, no una máquina.
-      await sleep(Math.min(4000, 700 + r.reply.length * 15) + Math.random() * 800)
-      await enviar(uuid, sock, jid, { text: r.reply })
-    }
+    if (reply) await enviar(uuid, sock, jid, { text: reply })
   } catch (e) {
     log(uuid, 'error al responder', e.message)
   } finally {
