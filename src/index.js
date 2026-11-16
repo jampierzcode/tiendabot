@@ -15,6 +15,9 @@ const OUTBOX_POLL_MS = Number(process.env.OUTBOX_POLL_MS || 2000)
 const DELAY_MIN = Number(process.env.SEND_DELAY_MIN_MS || 1500)
 const DELAY_MAX = Number(process.env.SEND_DELAY_MAX_MS || 4000)
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 120000)
+// Un QR que nadie escanea mantiene un Chromium abierto (~200 MB) para siempre.
+// Pasado este tiempo se cierra; el dueño lo vuelve a pedir con «Conectar».
+const QR_TIMEOUT_MS = Number(process.env.QR_TIMEOUT_MS || 180000)
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './.sessions'
 // Navegadores precargados en espera (sin sesión guardada): cada uno cuesta
 // ~200 MB de RAM, pero «Conectar» muestra el QR al instante.
@@ -277,6 +280,13 @@ async function sincronizarSesiones() {
       const vivo = clients.get(s.businessUuid)
       if (vivo && vivo.status === 'connecting' && Date.now() - vivo.since > CONNECT_TIMEOUT_MS) {
         log(s.businessUuid, 'sin conectar tras 2 min: reiniciando navegador')
+        await apagar(s.businessUuid)
+        continue
+      }
+      if (vivo && vivo.status === 'qr' && !vivo.standby && Date.now() - vivo.since > QR_TIMEOUT_MS) {
+        log(s.businessUuid, 'QR sin escanear: cierro el navegador hasta que vuelvan a pulsar Conectar')
+        // Espera indefinida: solo «Conectar»/«Reintentar» en el panel (status connecting) la levanta.
+        fallos.set(s.businessUuid, { n: 0, hasta: Infinity })
         await apagar(s.businessUuid)
         continue
       }
