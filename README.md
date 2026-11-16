@@ -15,6 +15,14 @@ Flujo: el dueño pulsa «Conectar» en el panel → el backend marca `desired=co
 escanea → `connected`. Cada cambio de estado de un pedido encola un mensaje que
 el bot envía con pausas aleatorias.
 
+**Asistente de ventas con IA:** cada mensaje del cliente va a `/api/bot/inbound`;
+el backend (`SalesAgentService`) conversa con OpenAI usando herramientas que leen
+el catálogo, cotizan, crean pedidos reales y consultan su estado. El bot solo
+junta los mensajes seguidos, muestra «escribiendo…», manda el texto y las fotos.
+Si el dueño responde a mano (desde el panel o desde su celular), el asistente
+se calla con ese cliente durante `AI_AGENT_HUMAN_PAUSE_MIN` minutos.
+Requiere `OPENAI_API_KEY` en el backend; sin ella se usan las reglas fijas.
+
 **Aviso:** whatsapp-web.js no es oficial; WhatsApp puede bloquear números que
 envíen mucho o sin consentimiento. Usar solo para avisos de pedidos que el
 cliente mismo inició. Cada sesión consume ~150-300 MB de RAM (Chromium).

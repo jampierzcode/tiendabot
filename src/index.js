@@ -4,7 +4,11 @@ import { join } from 'node:path'
 import pkg from 'whatsapp-web.js'
 import { api } from './api.js'
 
-const { Client, LocalAuth } = pkg
+const { Client, LocalAuth, MessageMedia } = pkg
+const API_URL = (process.env.API_URL || 'http://localhost:4444').replace(/\/$/, '')
+// Mensajes seguidos del cliente («hola» «quiero un polo» «talla M») se juntan
+// en uno solo si llegan dentro de esta ventana: una respuesta, no tres.
+const AGRUPAR_MS = Number(process.env.INBOUND_DEBOUNCE_MS || 2500)
 
 const SESSIONS_POLL_MS = Number(process.env.SESSIONS_POLL_MS || 2000)
 const OUTBOX_POLL_MS = Number(process.env.OUTBOX_POLL_MS || 2000)
@@ -48,6 +52,114 @@ async function report(uuid, payload) {
     await api.reportSession(uuid, payload)
   } catch (e) {
     log('no pude reportar sesión', uuid, e.message)
+  }
+}
+
+/**
+ * WhatsApp ya entrega muchos chats con un id interno (@lid) que NO es el
+ * teléfono. Se resuelve el número real por varias vías; solo si ninguna sirve
+ * se usa el id (y el envío lo intenta por @lid).
+ */
+async function resolverTelefono(entry, jid, obtenerContacto) {
+  let telefono = jid.replace(/@.*/, '')
+  if (!jid.endsWith('@lid')) return telefono
+  try {
+    const [par] = await entry.client.getContactLidAndPhone([jid])
+    const pn = String(par?.pn || '').replace(/@.*/, '').replace(/\D/g, '')
+    if (pn) return pn
+  } catch {}
+  try {
+    const contacto = await obtenerContacto()
+    const real = String(contacto?.number || '').replace(/\D/g, '')
+    if (real) telefono = real
+  } catch {}
+  return telefono
+}
+
+/**
+ * Lo que el bot está por mandar se anota antes de enviarlo: así, cuando
+ * WhatsApp avisa «salió un mensaje de este número», se sabe si fue el bot o
+ * el dueño escribiendo desde su celular.
+ */
+// Por negocio y por texto (no por chat): WhatsApp a veces reporta el mismo
+// chat como número@c.us al enviar y como @lid al confirmar.
+const enviadosPorBot = new Map() // uuid -> [{ texto, hasta }]
+function anotarEnvio(uuid, _chat, texto) {
+  const ahora = Date.now()
+  const lista = (enviadosPorBot.get(uuid) || []).filter((e) => e.hasta > ahora)
+  lista.push({ texto: String(texto || '').trim(), hasta: ahora + 120000 })
+  enviadosPorBot.set(uuid, lista)
+}
+function esDelBot(uuid, _chat, texto) {
+  const ahora = Date.now()
+  const lista = (enviadosPorBot.get(uuid) || []).filter((e) => e.hasta > ahora)
+  const limpio = String(texto || '').trim()
+  const i = lista.findIndex((e) => e.texto === limpio)
+  if (i >= 0) lista.splice(i, 1)
+  enviadosPorBot.set(uuid, lista)
+  return i >= 0
+}
+
+/** Mensajes del cliente en espera de juntarse, y la respuesta en curso por chat. */
+const buzones = new Map() // `${uuid}|${from}` -> { msgs, timer, cadena }
+
+function encolarEntrante(uuid, entry, msg) {
+  const k = `${uuid}|${msg.from}`
+  const b = buzones.get(k) || { msgs: [], timer: null, cadena: Promise.resolve() }
+  buzones.set(k, b)
+  b.msgs.push(msg)
+  clearTimeout(b.timer)
+  b.timer = setTimeout(() => {
+    const lote = b.msgs.splice(0)
+    // Una respuesta a la vez por chat: si el cliente escribe mientras el bot
+    // piensa, lo nuevo espera su turno en vez de cruzarse.
+    b.cadena = b.cadena.then(() => atender(uuid, entry, lote)).catch(() => {})
+  }, AGRUPAR_MS)
+}
+
+async function atender(uuid, entry, lote) {
+  const ultimo = lote[lote.length - 1]
+  const textos = lote.map((m) => (m.body || '').trim()).filter(Boolean)
+  // Si alguno no es texto (foto, audio…), se avisa el tipo del último que no lo sea.
+  const noTexto = [...lote].reverse().find((m) => m.type && m.type !== 'chat')
+  try {
+    const telefono = await resolverTelefono(entry, ultimo.from, () => ultimo.getContact())
+    if (process.env.DEBUG_INBOUND !== '0') {
+      log(uuid, 'mensaje entrante', JSON.stringify({ from: ultimo.from, resuelto: telefono, n: lote.length }))
+    }
+
+    let chat = null
+    try {
+      chat = await ultimo.getChat()
+      await chat.sendSeen()
+      await chat.sendStateTyping()
+    } catch {}
+
+    const r = await api.inbound(uuid, telefono, textos.join('\n'), noTexto?.type || 'chat')
+
+    for (const m of r?.media || []) {
+      try {
+        const url = /^https?:\/\//.test(m.url) ? m.url : `${API_URL}${m.url}`
+        const media = await MessageMedia.fromUrl(url, { unsafeMime: true })
+        anotarEnvio(uuid, ultimo.from, m.caption)
+        await entry.client.sendMessage(ultimo.from, media, { caption: m.caption, sendSeen: false })
+        await sleep(600 + Math.random() * 600)
+      } catch (e) {
+        log(uuid, 'no pude enviar foto', e.message)
+      }
+    }
+
+    if (r?.reply) {
+      // Pausa proporcional al largo: parece alguien escribiendo, no una máquina.
+      await sleep(Math.min(4000, 700 + r.reply.length * 15) + Math.random() * 800)
+      anotarEnvio(uuid, ultimo.from, r.reply)
+      await entry.client.sendMessage(ultimo.from, r.reply, { sendSeen: false })
+    }
+    try {
+      await chat?.clearState()
+    } catch {}
+  } catch (e) {
+    log(uuid, 'error al responder', e.message)
   }
 }
 
@@ -107,47 +219,22 @@ function levantar(uuid, standby = false) {
     if (msg.fromMe || msg.from.endsWith('@g.us') || msg.from === 'status@broadcast') return
     // Canales y newsletters (@newsletter) también llegan aquí: no son clientes.
     if (!msg.from.endsWith('@c.us') && !msg.from.endsWith('@lid')) return
+    encolarEntrante(uuid, entry, msg)
+  })
+
+  // Mensajes que salen de este número. Si no los mandó el bot, los escribió el
+  // dueño desde su celular: el asistente se aparta con ese cliente un rato.
+  client.on('message_create', async (msg) => {
+    if (!msg.fromMe) return
+    const destino = msg.to || ''
+    if (!destino.endsWith('@c.us') && !destino.endsWith('@lid')) return
+    if (esDelBot(uuid, destino, msg.body)) return
     try {
-      // WhatsApp ya entrega muchos chats con un id interno (@lid) que NO es el
-      // teléfono. Se resuelve el número real por varias vías; solo si ninguna
-      // sirve se usa el id (y el envío lo intenta por @lid).
-      let telefono = msg.from.replace(/@.*/, '')
-      const diag = { from: msg.from, author: msg.author ?? null, notifyName: msg._data?.notifyName ?? null }
-      if (msg.from.endsWith('@lid')) {
-        try {
-          const [par] = await entry.client.getContactLidAndPhone([msg.from])
-          diag.lidAndPhone = par
-          const pn = String(par?.pn || '').replace(/@.*/, '').replace(/\D/g, '')
-          if (pn) telefono = pn
-        } catch (e) {
-          diag.lidAndPhoneError = e.message
-        }
-        if (telefono === msg.from.replace(/@.*/, '')) {
-          try {
-            const contacto = await msg.getContact()
-            diag.contact = {
-              id: contacto?.id?._serialized,
-              number: contacto?.number,
-              name: contacto?.name,
-              pushname: contacto?.pushname,
-              isMyContact: contacto?.isMyContact,
-            }
-            const real = String(contacto?.number || '').replace(/\D/g, '')
-            if (real) telefono = real
-          } catch (e) {
-            diag.contactError = e.message
-          }
-        }
-      }
-      diag.resuelto = telefono
-      if (process.env.DEBUG_INBOUND !== '0') log(uuid, 'mensaje entrante', JSON.stringify(diag))
-      const reply = await api.inbound(uuid, telefono, msg.body)
-      if (reply) {
-        await sleep(800 + Math.random() * 1200)
-        await msg.reply(reply)
-      }
+      const telefono = await resolverTelefono(entry, destino, () => msg.getChat().then((c) => c.getContact()))
+      await api.ownerMessage(uuid, telefono, msg.body || '')
+      log(uuid, 'el dueño respondió a mano: asistente en pausa con', telefono)
     } catch (e) {
-      log(uuid, 'error al responder', e.message)
+      log(uuid, 'no pude registrar mensaje del dueño', e.message)
     }
   })
 
@@ -266,6 +353,7 @@ async function vaciarCola() {
         if (!destino) throw new Error('el número no tiene WhatsApp')
         // sendSeen:false evita marcar el chat como leído al enviar: esa llamada interna
         // (getChat) falla en algunas versiones de WhatsApp Web y tumbaba el envío.
+        anotarEnvio(m.businessUuid, destino, m.body)
         await entry.client.sendMessage(destino, m.body, { sendSeen: false })
         await api.result(m.id, true)
         log(m.businessUuid, 'enviado', m.id)
