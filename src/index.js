@@ -1,10 +1,30 @@
 import 'node:process'
-import { existsSync } from 'node:fs'
+import { existsSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
-import pkg from 'whatsapp-web.js'
+import makeWASocket, {
+  Browsers,
+  DisconnectReason,
+  fetchLatestBaileysVersion,
+  getContentType,
+  isJidBroadcast,
+  isJidGroup,
+  isJidNewsletter,
+  jidDecode,
+  normalizeMessageContent,
+  useMultiFileAuthState,
+} from 'baileys'
+import pino from 'pino'
 import { api } from './api.js'
 
-const { Client, LocalAuth, MessageMedia } = pkg
+/*
+ * Bot de WhatsApp con Baileys: habla el protocolo de WhatsApp Web por
+ * websocket, sin abrir un navegador. Cada negocio cuesta ~30-60 MB de RAM en
+ * vez de ~1 GB de Chromium (whatsapp-web.js), que era casi toda la factura.
+ *
+ * Igual que antes, NO guarda datos de negocio: el backend decide qué sesiones
+ * levantar, qué responder (asistente de IA) y qué avisos enviar.
+ */
+
 const API_URL = (process.env.API_URL || 'http://localhost:4444').replace(/\/$/, '')
 // Mensajes seguidos del cliente («hola» «quiero un polo» «talla M») se juntan
 // en uno solo si llegan dentro de esta ventana: una respuesta, no tres.
@@ -15,28 +35,22 @@ const OUTBOX_POLL_MS = Number(process.env.OUTBOX_POLL_MS || 2000)
 const DELAY_MIN = Number(process.env.SEND_DELAY_MIN_MS || 1500)
 const DELAY_MAX = Number(process.env.SEND_DELAY_MAX_MS || 4000)
 const CONNECT_TIMEOUT_MS = Number(process.env.CONNECT_TIMEOUT_MS || 120000)
-// Un QR que nadie escanea mantiene un Chromium abierto (~200 MB) para siempre.
-// Pasado este tiempo se cierra; el dueño lo vuelve a pedir con «Conectar».
+// Un QR que nadie escanea se cierra pasado este tiempo; se vuelve a pedir con «Conectar».
 const QR_TIMEOUT_MS = Number(process.env.QR_TIMEOUT_MS || 180000)
 const SESSIONS_DIR = process.env.SESSIONS_DIR || './.sessions'
-// Navegadores precargados en espera (sin sesión guardada): cada uno cuesta
-// ~200 MB de RAM, pero «Conectar» muestra el QR al instante.
-const PRELOAD_MAX = Number(
-  process.env.PRELOAD_MAX ?? (process.env.NODE_ENV === 'production' ? 0 : 2)
-)
 // Sondeo adaptativo: rápido solo cuando algo está cambiando (QR, conectando).
 const SESSIONS_IDLE_MS = Number(process.env.SESSIONS_IDLE_MS || 6000)
-const USER_AGENT =
-  process.env.WA_USER_AGENT ||
-  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/133.0.0.0 Safari/537.36'
 
-/** businessUuid -> { client, status } */
+const logger = pino({ level: process.env.BAILEYS_LOG || 'silent' })
+
+/** businessUuid -> { sock, status, since, cerrando } */
 const clients = new Map()
 
+const carpetaSesion = (uuid) => join(SESSIONS_DIR, 'baileys', uuid)
+
 /**
- * Fallos al abrir el navegador, por sesión. Sin esto un Chromium que no puede
- * arrancar se reintenta cada 2 s para siempre (y por cada negocio que alguna
- * vez abrió la pantalla de WhatsApp). Espera 15 s, 30 s, 60 s… hasta 10 min.
+ * Fallos al conectar, por sesión. Sin esto una sesión rota se reintenta cada
+ * 2 s para siempre. Espera 15 s, 30 s, 60 s… hasta 10 min.
  */
 const fallos = new Map() // uuid -> { n, hasta }
 function registrarFallo(uuid) {
@@ -44,7 +58,10 @@ function registrarFallo(uuid) {
   const espera = Math.min(15000 * 2 ** (n - 1), 10 * 60 * 1000)
   fallos.set(uuid, { n, hasta: Date.now() + espera })
   log(uuid, `reintento en ${Math.round(espera / 1000)} s (fallo ${n})`)
+  return n
 }
+/** Hasta que el dueño pulse «Conectar» en el panel (status connecting). */
+const esperarAlPanel = (uuid) => fallos.set(uuid, { n: 0, hasta: Infinity })
 const enEspera = (uuid) => (fallos.get(uuid)?.hasta ?? 0) > Date.now()
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
@@ -58,42 +75,98 @@ async function report(uuid, payload) {
   }
 }
 
+/** Versión vigente de WhatsApp Web; con una vieja WhatsApp rechaza la conexión. */
+let versionWA = null
+async function version() {
+  if (versionWA && Date.now() - versionWA.at < 6 * 3600 * 1000) return versionWA.v
+  try {
+    const { version: v } = await fetchLatestBaileysVersion()
+    versionWA = { v, at: Date.now() }
+    return v
+  } catch {
+    return versionWA?.v // undefined: Baileys usa la que trae
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Teléfonos y chats
+// ---------------------------------------------------------------------------
+
+const esChatDirecto = (jid) =>
+  Boolean(jid) &&
+  !isJidGroup(jid) &&
+  !isJidBroadcast(jid) &&
+  !isJidNewsletter(jid) &&
+  (jid.endsWith('@s.whatsapp.net') || jid.endsWith('@lid'))
+
 /**
- * WhatsApp ya entrega muchos chats con un id interno (@lid) que NO es el
- * teléfono. Se resuelve el número real por varias vías; solo si ninguna sirve
- * se usa el id (y el envío lo intenta por @lid).
+ * WhatsApp entrega muchos chats con un id interno (@lid) que NO es el
+ * teléfono. Baileys 7 trae el número en `remoteJidAlt` o en su mapa LID→PN;
+ * solo si nada sirve se usa el id (el envío lo intenta por @lid).
  */
-async function resolverTelefono(entry, jid, obtenerContacto) {
-  let telefono = jid.replace(/@.*/, '')
-  if (!jid.endsWith('@lid')) return telefono
+async function telefonoDe(sock, jid, alt) {
+  if (jid.endsWith('@s.whatsapp.net')) return jidDecode(jid).user
+  if (alt?.endsWith('@s.whatsapp.net')) return jidDecode(alt).user
   try {
-    const [par] = await entry.client.getContactLidAndPhone([jid])
-    const pn = String(par?.pn || '').replace(/@.*/, '').replace(/\D/g, '')
-    if (pn) return pn
+    const pn = await sock.signalRepository?.lidMapping?.getPNForLID(jid)
+    if (pn) return jidDecode(pn).user
   } catch {}
-  try {
-    const contacto = await obtenerContacto()
-    const real = String(contacto?.number || '').replace(/\D/g, '')
-    if (real) telefono = real
-  } catch {}
-  return telefono
+  return jidDecode(jid)?.user ?? jid.replace(/@.*/, '')
+}
+
+/** Texto y tipo de un mensaje; null si no es algo que un cliente «dice». */
+function leerMensaje(m) {
+  const c = normalizeMessageContent(m.message)
+  if (!c) return null
+  const tipo = getContentType(c)
+  const texto =
+    c.conversation ||
+    c.extendedTextMessage?.text ||
+    c.imageMessage?.caption ||
+    c.videoMessage?.caption ||
+    c.documentMessage?.caption ||
+    ''
+
+  switch (tipo) {
+    case 'conversation':
+    case 'extendedTextMessage':
+      return texto.trim() ? { texto, kind: 'chat' } : null
+    case 'imageMessage':
+      return { texto, kind: 'image' }
+    case 'audioMessage':
+      return { texto: '', kind: c.audioMessage?.ptt ? 'ptt' : 'audio' }
+    case 'videoMessage':
+      return { texto, kind: 'video' }
+    case 'documentMessage':
+      return { texto, kind: 'document' }
+    case 'stickerMessage':
+      return { texto: '', kind: 'sticker' }
+    case 'locationMessage':
+    case 'liveLocationMessage': {
+      const l = c.locationMessage || c.liveLocationMessage
+      const enlace = `https://maps.google.com/?q=${l?.degreesLatitude},${l?.degreesLongitude}`
+      return { texto: `Mi ubicación: ${[l?.name, l?.address].filter(Boolean).join(', ')} ${enlace}`.trim(), kind: 'location' }
+    }
+    default:
+      // Reacciones, ediciones, borrados, encuestas…: no se responden.
+      return null
+  }
 }
 
 /**
  * Lo que el bot está por mandar se anota antes de enviarlo: así, cuando
  * WhatsApp avisa «salió un mensaje de este número», se sabe si fue el bot o
- * el dueño escribiendo desde su celular.
+ * el dueño escribiendo desde su celular. Por negocio y por texto (no por
+ * chat): el mismo chat puede aparecer como número o como @lid.
  */
-// Por negocio y por texto (no por chat): WhatsApp a veces reporta el mismo
-// chat como número@c.us al enviar y como @lid al confirmar.
 const enviadosPorBot = new Map() // uuid -> [{ texto, hasta }]
-function anotarEnvio(uuid, _chat, texto) {
+function anotarEnvio(uuid, texto) {
   const ahora = Date.now()
   const lista = (enviadosPorBot.get(uuid) || []).filter((e) => e.hasta > ahora)
   lista.push({ texto: String(texto || '').trim(), hasta: ahora + 120000 })
   enviadosPorBot.set(uuid, lista)
 }
-function esDelBot(uuid, _chat, texto) {
+function esDelBot(uuid, texto) {
   const ahora = Date.now()
   const lista = (enviadosPorBot.get(uuid) || []).filter((e) => e.hasta > ahora)
   const limpio = String(texto || '').trim()
@@ -103,49 +176,63 @@ function esDelBot(uuid, _chat, texto) {
   return i >= 0
 }
 
-/** Mensajes del cliente en espera de juntarse, y la respuesta en curso por chat. */
-const buzones = new Map() // `${uuid}|${from}` -> { msgs, timer, cadena }
+async function enviar(uuid, sock, jid, contenido) {
+  anotarEnvio(uuid, contenido.text ?? contenido.caption ?? '')
+  return sock.sendMessage(jid, contenido)
+}
 
-function encolarEntrante(uuid, entry, msg) {
-  const k = `${uuid}|${msg.from}`
+// ---------------------------------------------------------------------------
+// Mensajes entrantes: se juntan, se responden de a uno por chat
+// ---------------------------------------------------------------------------
+
+const buzones = new Map() // `${uuid}|${jid}` -> { msgs, timer, cadena }
+
+function encolarEntrante(uuid, m, leido) {
+  const k = `${uuid}|${m.key.remoteJid}`
   const b = buzones.get(k) || { msgs: [], timer: null, cadena: Promise.resolve() }
   buzones.set(k, b)
-  b.msgs.push(msg)
+  b.msgs.push({ m, ...leido })
   clearTimeout(b.timer)
   b.timer = setTimeout(() => {
     const lote = b.msgs.splice(0)
     // Una respuesta a la vez por chat: si el cliente escribe mientras el bot
     // piensa, lo nuevo espera su turno en vez de cruzarse.
-    b.cadena = b.cadena.then(() => atender(uuid, entry, lote)).catch(() => {})
+    b.cadena = b.cadena
+      .then(() => atender(uuid, lote))
+      .catch(() => {})
+      .finally(() => {
+        if (!b.msgs.length && buzones.get(k) === b) buzones.delete(k)
+      })
   }, AGRUPAR_MS)
 }
 
-async function atender(uuid, entry, lote) {
-  const ultimo = lote[lote.length - 1]
-  const textos = lote.map((m) => (m.body || '').trim()).filter(Boolean)
+async function atender(uuid, lote) {
+  const entry = clients.get(uuid)
+  if (!entry || entry.status !== 'connected') return
+  const { sock } = entry
+  const ultimo = lote[lote.length - 1].m
+  const jid = ultimo.key.remoteJid
+  const textos = lote.map((x) => x.texto.trim()).filter(Boolean)
   // Si alguno no es texto (foto, audio…), se avisa el tipo del último que no lo sea.
-  const noTexto = [...lote].reverse().find((m) => m.type && m.type !== 'chat')
+  const noTexto = [...lote].reverse().find((x) => x.kind !== 'chat')
+
   try {
-    const telefono = await resolverTelefono(entry, ultimo.from, () => ultimo.getContact())
+    const telefono = await telefonoDe(sock, jid, ultimo.key.remoteJidAlt)
     if (process.env.DEBUG_INBOUND !== '0') {
-      log(uuid, 'mensaje entrante', JSON.stringify({ from: ultimo.from, resuelto: telefono, n: lote.length }))
+      log(uuid, 'mensaje entrante', JSON.stringify({ jid, resuelto: telefono, n: lote.length }))
     }
 
-    let chat = null
     try {
-      chat = await ultimo.getChat()
-      await chat.sendSeen()
-      await chat.sendStateTyping()
+      await sock.readMessages(lote.map((x) => x.m.key))
+      await sock.sendPresenceUpdate('composing', jid)
     } catch {}
 
-    const r = await api.inbound(uuid, telefono, textos.join('\n'), noTexto?.type || 'chat')
+    const r = await api.inbound(uuid, telefono, textos.join('\n'), noTexto?.kind || 'chat')
 
-    for (const m of r?.media || []) {
+    for (const f of r?.media || []) {
       try {
-        const url = /^https?:\/\//.test(m.url) ? m.url : `${API_URL}${m.url}`
-        const media = await MessageMedia.fromUrl(url, { unsafeMime: true })
-        anotarEnvio(uuid, ultimo.from, m.caption)
-        await entry.client.sendMessage(ultimo.from, media, { caption: m.caption, sendSeen: false })
+        const url = /^https?:\/\//.test(f.url) ? f.url : `${API_URL}${f.url}`
+        await enviar(uuid, sock, jid, { image: { url }, caption: f.caption })
         await sleep(600 + Math.random() * 600)
       } catch (e) {
         log(uuid, 'no pude enviar foto', e.message)
@@ -155,123 +242,149 @@ async function atender(uuid, entry, lote) {
     if (r?.reply) {
       // Pausa proporcional al largo: parece alguien escribiendo, no una máquina.
       await sleep(Math.min(4000, 700 + r.reply.length * 15) + Math.random() * 800)
-      anotarEnvio(uuid, ultimo.from, r.reply)
-      await entry.client.sendMessage(ultimo.from, r.reply, { sendSeen: false })
+      await enviar(uuid, sock, jid, { text: r.reply })
     }
-    try {
-      await chat?.clearState()
-    } catch {}
   } catch (e) {
     log(uuid, 'error al responder', e.message)
-  }
-}
-
-function levantar(uuid, standby = false) {
-  if (clients.has(uuid)) return
-
-  const client = new Client({
-    authStrategy: new LocalAuth({ clientId: uuid, dataPath: SESSIONS_DIR }),
-    // Sin esto el navegador se anuncia como «HeadlessChrome» y WhatsApp Web
-    // no llega a mostrar el QR (la librería se queda en «Navigating frame was detached»).
-    userAgent: USER_AGENT,
-    puppeteer: {
-      headless: true,
-      // En el contenedor se usa el Chromium del sistema (ver Dockerfile).
-      executablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-        '--disable-gpu',
-        // Menos procesos y menos memoria por navegador: no hay pestañas de
-        // terceros que aislar, solo WhatsApp Web.
-        '--no-zygote',
-        '--no-first-run',
-        '--disable-extensions',
-        '--disable-default-apps',
-        '--disable-background-networking',
-        '--disable-sync',
-        '--disable-translate',
-        '--mute-audio',
-        '--disable-features=site-per-process,Translate,MediaRouter,OptimizationHints',
-        '--renderer-process-limit=1',
-        '--disk-cache-size=1',
-        '--media-cache-size=1',
-      ],
-    },
-  })
-
-  // standby: navegador abierto y QR listo, pero nadie lo pidió aún (no se reporta).
-  const entry = { client, status: 'connecting', since: Date.now(), standby, lastQr: null }
-  clients.set(uuid, entry)
-
-  client.on('qr', async (qr) => {
-    entry.status = 'qr'
-    entry.lastQr = qr
-    log(uuid, standby && entry.standby ? 'QR listo (en espera)' : 'QR listo')
-    if (!entry.standby) await report(uuid, { status: 'qr', qr })
-  })
-
-  client.on('ready', async () => {
-    entry.status = 'connected'
-    fallos.delete(uuid)
-    const phone = client.info?.wid?.user ?? null
-    log(uuid, 'conectado', phone)
-    await report(uuid, { status: 'connected', connectedPhone: phone })
-  })
-
-  client.on('auth_failure', async (m) => {
-    log(uuid, 'fallo de autenticación', m)
-    registrarFallo(uuid)
-    await apagar(uuid)
-  })
-
-  client.on('disconnected', async (reason) => {
-    log(uuid, 'desconectado', reason)
-    await apagar(uuid)
-  })
-
-  client.on('message', async (msg) => {
-    // Solo chats directos; ignora grupos, estados y mensajes propios.
-    if (msg.fromMe || msg.from.endsWith('@g.us') || msg.from === 'status@broadcast') return
-    // Canales y newsletters (@newsletter) también llegan aquí: no son clientes.
-    if (!msg.from.endsWith('@c.us') && !msg.from.endsWith('@lid')) return
-    encolarEntrante(uuid, entry, msg)
-  })
-
-  // Mensajes que salen de este número. Si no los mandó el bot, los escribió el
-  // dueño desde su celular: el asistente se aparta con ese cliente un rato.
-  client.on('message_create', async (msg) => {
-    if (!msg.fromMe) return
-    const destino = msg.to || ''
-    if (!destino.endsWith('@c.us') && !destino.endsWith('@lid')) return
-    if (esDelBot(uuid, destino, msg.body)) return
+  } finally {
     try {
-      const telefono = await resolverTelefono(entry, destino, () => msg.getChat().then((c) => c.getContact()))
-      await api.ownerMessage(uuid, telefono, msg.body || '')
-      log(uuid, 'el dueño respondió a mano: asistente en pausa con', telefono)
-    } catch (e) {
-      log(uuid, 'no pude registrar mensaje del dueño', e.message)
-    }
-  })
-
-  client.initialize().catch(async (e) => {
-    log(uuid, 'no pudo iniciar', e.message.split('\n')[0])
-    registrarFallo(uuid)
-    await apagar(uuid)
-  })
-}
-
-async function apagar(uuid) {
-  const entry = clients.get(uuid)
-  clients.delete(uuid)
-  if (entry) {
-    try {
-      await entry.client.destroy()
+      await sock.sendPresenceUpdate('paused', jid)
     } catch {}
   }
-  // Un navegador precargado nadie lo pidió: su fallo no es noticia para el panel.
-  if (!entry?.standby) await report(uuid, { status: 'disconnected' })
+}
+
+/** El dueño escribió desde su celular: el asistente se aparta con ese cliente. */
+async function mensajeDelDueno(uuid, sock, m, leido) {
+  if (esDelBot(uuid, leido?.texto ?? '')) return
+  try {
+    const telefono = await telefonoDe(sock, m.key.remoteJid, m.key.remoteJidAlt)
+    await api.ownerMessage(uuid, telefono, leido?.texto || '')
+    log(uuid, 'el dueño respondió a mano: asistente en pausa con', telefono)
+  } catch (e) {
+    log(uuid, 'no pude registrar mensaje del dueño', e.message)
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Sesiones
+// ---------------------------------------------------------------------------
+
+async function levantar(uuid) {
+  if (clients.has(uuid)) return
+  const entry = { sock: null, status: 'connecting', since: Date.now(), cerrando: false }
+  clients.set(uuid, entry)
+
+  try {
+    const { state, saveCreds } = await useMultiFileAuthState(carpetaSesion(uuid))
+    const sock = makeWASocket({
+      version: await version(),
+      auth: state,
+      logger,
+      browser: Browsers.macOS('Chrome'),
+      // Sin «en línea»: el celular del dueño sigue recibiendo sus notificaciones.
+      markOnlineOnConnect: false,
+      // Nada de historial: es lo que más memoria gastaría y el bot no lo usa.
+      syncFullHistory: false,
+      shouldSyncHistoryMessage: () => false,
+      generateHighQualityLinkPreview: false,
+      getMessage: async () => undefined,
+    })
+    entry.sock = sock
+
+    sock.ev.on('creds.update', saveCreds)
+
+    sock.ev.on('connection.update', async (u) => {
+      if (entry.cerrando || clients.get(uuid) !== entry) return
+
+      if (u.qr) {
+        entry.status = 'qr'
+        log(uuid, 'QR listo')
+        await report(uuid, { status: 'qr', qr: u.qr })
+      }
+
+      if (u.connection === 'open') {
+        entry.status = 'connected'
+        fallos.delete(uuid)
+        const phone = jidDecode(sock.user?.id ?? '')?.user ?? null
+        log(uuid, 'conectado', phone)
+        await report(uuid, { status: 'connected', connectedPhone: phone })
+      }
+
+      if (u.connection === 'close') {
+        const codigo = u.lastDisconnect?.error?.output?.statusCode
+        const estabaConectado = entry.status === 'connected'
+        clients.delete(uuid)
+        log(uuid, 'conexión cerrada', codigo ?? '')
+
+        if (codigo === DisconnectReason.restartRequired) {
+          // Normal justo después de escanear el QR: se reconecta ya con la sesión.
+          levantar(uuid)
+          return
+        }
+        if (codigo === DisconnectReason.loggedOut || codigo === DisconnectReason.forbidden) {
+          // Desvincularon el dispositivo desde el celular: la sesión ya no sirve.
+          rmSync(carpetaSesion(uuid), { recursive: true, force: true })
+          esperarAlPanel(uuid)
+          await report(uuid, { status: 'disconnected' })
+          return
+        }
+        if (codigo === DisconnectReason.connectionReplaced) {
+          // Otra instancia del bot abrió la misma sesión (p. ej. dos despliegues a la vez).
+          esperarAlPanel(uuid)
+          await report(uuid, { status: 'disconnected' })
+          return
+        }
+        if (entry.status === 'qr') {
+          // WhatsApp dejó de generar QR porque nadie lo escaneó: se espera al panel.
+          esperarAlPanel(uuid)
+          await report(uuid, { status: 'disconnected' })
+          return
+        }
+        // Corte de red u otro: se reintenta con espera creciente. Solo se avisa
+        // al panel si no se recupera, para no asustar por un corte de segundos.
+        const n = registrarFallo(uuid)
+        if (!estabaConectado || n >= 3) await report(uuid, { status: 'disconnected' })
+      }
+    })
+
+    sock.ev.on('messages.upsert', async ({ messages, type }) => {
+      // 'append' = lo que llega al reconectar o lo que envía el propio bot: no se responde.
+      if (type !== 'notify') return
+      for (const m of messages) {
+        const jid = m.key?.remoteJid
+        if (!esChatDirecto(jid) || !m.message) continue
+        const leido = leerMensaje(m)
+        if (m.key.fromMe) {
+          await mensajeDelDueno(uuid, sock, m, leido)
+          continue
+        }
+        if (leido) encolarEntrante(uuid, m, leido)
+      }
+    })
+  } catch (e) {
+    log(uuid, 'no pudo iniciar', e.message)
+    clients.delete(uuid)
+    registrarFallo(uuid)
+    await report(uuid, { status: 'disconnected' })
+  }
+}
+
+/**
+ * Cierra la sesión. Con `olvidar` además la desvincula de WhatsApp y borra lo
+ * guardado (el próximo «Conectar» pide QR); sin él solo libera la memoria.
+ */
+async function apagar(uuid, { olvidar = false, avisar = true } = {}) {
+  const entry = clients.get(uuid)
+  clients.delete(uuid)
+  if (entry?.sock) {
+    entry.cerrando = true
+    try {
+      if (olvidar) await entry.sock.logout()
+      else entry.sock.end(undefined)
+    } catch {}
+  }
+  if (olvidar) rmSync(carpetaSesion(uuid), { recursive: true, force: true })
+  if (avisar) await report(uuid, { status: 'disconnected' })
 }
 
 // ¿Hay algo cambiando? Decide si el siguiente sondeo es rápido o tranquilo.
@@ -282,73 +395,50 @@ async function sincronizarSesiones() {
     const sesiones = await api.sessions()
     let actividad = false
     for (const s of sesiones) {
-      if (!s.businessUuid) continue
+      const uuid = s.businessUuid
+      if (!uuid) continue
 
       // El panel pone «connecting» al pulsar Conectar/Reintentar: eso cancela la espera.
-      if (s.status === 'connecting' && !clients.has(s.businessUuid)) fallos.delete(s.businessUuid)
+      if (s.status === 'connecting' && !clients.has(uuid)) fallos.delete(uuid)
       if (s.status === 'connecting' || s.status === 'qr') actividad = true
 
-      // Vigilante: restaurar una sesión guardada a veces se queda colgado sin
-      // error ni QR. Pasados 2 minutos sin conectar se descarta y se reintenta
-      // (la sesión guardada se conserva; solo se reinicia el navegador).
-      const vivo = clients.get(s.businessUuid)
+      const vivo = clients.get(uuid)
+      // Vigilantes: conexión colgada, o QR que nadie escanea.
       if (vivo && vivo.status === 'connecting' && Date.now() - vivo.since > CONNECT_TIMEOUT_MS) {
-        log(s.businessUuid, 'sin conectar tras 2 min: reiniciando navegador')
-        await apagar(s.businessUuid)
+        log(uuid, 'sin conectar tras 2 min: reintento')
+        await apagar(uuid, { avisar: false })
         continue
       }
-      if (vivo && vivo.status === 'qr' && !vivo.standby && Date.now() - vivo.since > QR_TIMEOUT_MS) {
-        log(s.businessUuid, 'QR sin escanear: cierro el navegador hasta que vuelvan a pulsar Conectar')
-        // Espera indefinida: solo «Conectar»/«Reintentar» en el panel (status connecting) la levanta.
-        fallos.set(s.businessUuid, { n: 0, hasta: Infinity })
-        await apagar(s.businessUuid)
+      if (vivo && vivo.status === 'qr' && Date.now() - vivo.since > QR_TIMEOUT_MS) {
+        log(uuid, 'QR sin escanear: cierro hasta que vuelvan a pulsar Conectar')
+        esperarAlPanel(uuid)
+        await apagar(uuid)
         continue
       }
-      if (s.desired === 'connected' && !clients.has(s.businessUuid) && !enEspera(s.businessUuid)) {
-        levantar(s.businessUuid)
+
+      if (s.desired === 'connected' && !clients.has(uuid) && !enEspera(uuid)) {
+        levantar(uuid)
         actividad = true
       }
 
-      // Alguien pidió conectar y ya había un navegador precargado: se entrega
-      // el QR que tiene guardado en vez de arrancar de cero.
-      const previo = clients.get(s.businessUuid)
-      if (s.desired === 'connected' && previo?.standby) {
-        previo.standby = false
-        previo.since = Date.now()
-        log(s.businessUuid, 'usando navegador precargado')
-        if (previo.lastQr) await report(s.businessUuid, { status: 'qr', qr: previo.lastQr })
-      }
-
-      // Precarga: sesión sin vincular que el panel ya abrió. Si ya hay una
-      // sesión guardada no se precarga (se conectaría sola sin que lo pidan).
-      if (
-        s.desired === 'disconnected' &&
-        !clients.has(s.businessUuid) &&
-        !enEspera(s.businessUuid) &&
-        [...clients.values()].filter((c) => c.standby).length < PRELOAD_MAX &&
-        !existsSync(join(SESSIONS_DIR, `session-${s.businessUuid}`))
-      ) {
-        log(s.businessUuid, 'precargando navegador')
-        levantar(s.businessUuid, true)
-      }
-
-      // Negocio desactivado o con el plan vencido: se apaga el navegador pero
+      // Negocio desactivado o con el plan vencido: se cierra la conexión pero
       // se conserva la sesión, para que al renovar vuelva sin escanear.
-      if (s.desired === 'paused' && clients.has(s.businessUuid)) {
-        log(s.businessUuid, 'negocio sin plan vigente: apago su navegador (la sesión se conserva)')
-        await apagar(s.businessUuid)
+      if (s.desired === 'paused' && clients.has(uuid)) {
+        log(uuid, 'negocio sin plan vigente: cierro su sesión (se conserva)')
+        await apagar(uuid)
         continue
       }
 
-      if (s.desired === 'disconnected' && clients.has(s.businessUuid) && !clients.get(s.businessUuid).standby) {
-        const entry = clients.get(s.businessUuid)
-        try {
-          await entry.client.logout() // olvida la sesión: el próximo connect pide QR
-        } catch {}
-        await apagar(s.businessUuid)
+      if (s.desired === 'disconnected') {
+        if (clients.has(uuid)) {
+          await apagar(uuid, { olvidar: true })
+        } else if (existsSync(carpetaSesion(uuid))) {
+          // Desconectado con el bot apagado: que el próximo «Conectar» pida QR.
+          rmSync(carpetaSesion(uuid), { recursive: true, force: true })
+        }
       }
     }
-    hayActividad = actividad || [...clients.values()].some((c) => c.status === 'connecting' && !c.standby)
+    hayActividad = actividad || [...clients.values()].some((c) => c.status !== 'connected')
   } catch (e) {
     log('sync sesiones:', e.message)
   }
@@ -357,6 +447,18 @@ async function sincronizarSesiones() {
 async function cicloSesiones() {
   await sincronizarSesiones()
   setTimeout(cicloSesiones, hayActividad ? SESSIONS_POLL_MS : SESSIONS_IDLE_MS)
+}
+
+// ---------------------------------------------------------------------------
+// Cola de avisos (cambios de estado de pedidos, mensajes desde el panel)
+// ---------------------------------------------------------------------------
+
+async function destinoDe(sock, phone) {
+  // Un id @lid (chat que nunca dio su número) se envía directo.
+  if (phone.length > 13) return `${phone}@lid`
+  const [r] = await sock.onWhatsApp(phone).catch(() => [])
+  if (!r?.exists) return null
+  return r.jid
 }
 
 let enviando = false
@@ -379,14 +481,9 @@ async function vaciarCola() {
       }
 
       try {
-        // Un número real se valida; un id @lid (chat antiguo) se envía directo.
-        const numero = await entry.client.getNumberId(m.phone).catch(() => null)
-        const destino = numero?._serialized ?? (m.phone.length > 13 ? `${m.phone}@lid` : null)
+        const destino = await destinoDe(entry.sock, m.phone)
         if (!destino) throw new Error('el número no tiene WhatsApp')
-        // sendSeen:false evita marcar el chat como leído al enviar: esa llamada interna
-        // (getChat) falla en algunas versiones de WhatsApp Web y tumbaba el envío.
-        anotarEnvio(m.businessUuid, destino, m.body)
-        await entry.client.sendMessage(destino, m.body, { sendSeen: false })
+        await enviar(m.businessUuid, entry.sock, destino, { text: m.body })
         await api.result(m.id, true)
         log(m.businessUuid, 'enviado', m.id)
       } catch (e) {
@@ -404,9 +501,8 @@ async function vaciarCola() {
   }
 }
 
-// whatsapp-web.js lanza rechazos sueltos (p. ej. «auth timeout» de un intento
-// ya descartado). Node 24 mata el proceso ante cualquiera; un bot que debe
-// vivir siempre los registra y sigue: el reintento lo hace sincronizarSesiones.
+// Un bot que debe vivir siempre registra los rechazos sueltos y sigue: el
+// reintento lo hace sincronizarSesiones.
 process.on('unhandledRejection', (motivo) => {
   log('rechazo no manejado (ignorado):', motivo?.message ?? motivo)
 })
@@ -414,15 +510,18 @@ process.on('uncaughtException', (error) => {
   log('excepción no capturada (ignorada):', error?.message ?? error)
 })
 
-log('bot iniciado')
+log('bot iniciado (Baileys)')
 setInterval(vaciarCola, OUTBOX_POLL_MS)
 cicloSesiones()
 
-process.on('SIGINT', async () => {
-  for (const uuid of [...clients.keys()]) {
+async function salir() {
+  for (const entry of clients.values()) {
+    entry.cerrando = true
     try {
-      await clients.get(uuid).client.destroy()
+      entry.sock?.end(undefined)
     } catch {}
   }
   process.exit(0)
-})
+}
+process.on('SIGINT', salir)
+process.on('SIGTERM', salir)

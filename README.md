@@ -1,7 +1,7 @@
 # tiendaBot
 
 Servicio independiente que conecta el número de WhatsApp de cada negocio
-(whatsapp-web.js) y envía los avisos de pedido. No guarda datos de negocio:
+(Baileys, sin navegador) y envía los avisos de pedido. No guarda datos de negocio:
 todo vive en el backend (`tiendaApp`) y este proceso solo consulta y ejecuta.
 
 ```
@@ -23,6 +23,6 @@ Si el dueño responde a mano (desde el panel o desde su celular), el asistente
 se calla con ese cliente durante `AI_AGENT_HUMAN_PAUSE_MIN` minutos.
 Requiere `OPENAI_API_KEY` en el backend; sin ella se usan las reglas fijas.
 
-**Aviso:** whatsapp-web.js no es oficial; WhatsApp puede bloquear números que
+**Aviso:** Baileys no es oficial; WhatsApp puede bloquear números que
 envíen mucho o sin consentimiento. Usar solo para avisos de pedidos que el
-cliente mismo inició. Cada sesión consume ~150-300 MB de RAM (Chromium).
+cliente mismo inició. Cada sesión consume ~15-60 MB de RAM (Baileys, sin Chromium).

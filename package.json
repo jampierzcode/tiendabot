@@ -8,6 +8,7 @@
     "dev": "node --watch --env-file-if-exists=.env src/index.js"
   },
   "dependencies": {
-    "whatsapp-web.js": "^1.34.1"
+    "baileys": "^7.0.0-rc14",
+    "pino": "^10.4.0"
   }
 }
