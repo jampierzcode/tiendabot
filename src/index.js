@@ -183,6 +183,20 @@ function levantar(uuid, standby = false) {
         '--disable-setuid-sandbox',
         '--disable-dev-shm-usage',
         '--disable-gpu',
+        // Menos procesos y menos memoria por navegador: no hay pestañas de
+        // terceros que aislar, solo WhatsApp Web.
+        '--no-zygote',
+        '--no-first-run',
+        '--disable-extensions',
+        '--disable-default-apps',
+        '--disable-background-networking',
+        '--disable-sync',
+        '--disable-translate',
+        '--mute-audio',
+        '--disable-features=site-per-process,Translate,MediaRouter,OptimizationHints',
+        '--renderer-process-limit=1',
+        '--disk-cache-size=1',
+        '--media-cache-size=1',
       ],
     },
   })
@@ -316,6 +330,14 @@ async function sincronizarSesiones() {
       ) {
         log(s.businessUuid, 'precargando navegador')
         levantar(s.businessUuid, true)
+      }
+
+      // Negocio desactivado o con el plan vencido: se apaga el navegador pero
+      // se conserva la sesión, para que al renovar vuelva sin escanear.
+      if (s.desired === 'paused' && clients.has(s.businessUuid)) {
+        log(s.businessUuid, 'negocio sin plan vigente: apago su navegador (la sesión se conserva)')
+        await apagar(s.businessUuid)
+        continue
       }
 
       if (s.desired === 'disconnected' && clients.has(s.businessUuid) && !clients.get(s.businessUuid).standby) {
