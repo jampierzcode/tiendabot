@@ -23,6 +23,7 @@ export const api = {
     call(`/outbox/${id}/result`, { method: 'POST', body: { ok, error, requeue } }),
   inbound: (businessUuid, phone, text, kind = 'chat', images = []) =>
     call('/inbound', { method: 'POST', body: { businessUuid, phone, text, kind, images } }),
-  ownerMessage: (businessUuid, phone, text) =>
-    call('/owner-message', { method: 'POST', body: { businessUuid, phone, text } }),
+  /** `pause: false` = respuesta automática de WhatsApp Business: se anota sin callar al asistente. */
+  ownerMessage: (businessUuid, phone, text, pause = true) =>
+    call('/owner-message', { method: 'POST', body: { businessUuid, phone, text, pause } }),
 }

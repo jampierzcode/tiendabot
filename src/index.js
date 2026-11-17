@@ -276,13 +276,51 @@ async function atender(uuid, lote) {
   }
 }
 
+/**
+ * Cuándo escribió el cliente por última vez en cada chat (por número y por
+ * @lid). Sirve para reconocer las respuestas automáticas de WhatsApp Business
+ * (mensaje de bienvenida / de ausencia): salen del número del negocio al
+ * instante, sin que nadie las teclee, y no deben callar al asistente.
+ */
+const ultimaEntrada = new Map() // `${uuid}|${jid}` -> ms
+const AUTO_RESPUESTA_MS = Number(process.env.AUTO_REPLY_WINDOW_MS || 8000)
+function anotarEntrada(uuid, m) {
+  const ahora = Date.now()
+  for (const j of [m.key.remoteJid, m.key.remoteJidAlt]) if (j) ultimaEntrada.set(`${uuid}|${j}`, ahora)
+  if (ultimaEntrada.size > 5000) {
+    for (const [k, t] of ultimaEntrada) if (ahora - t > 60000) ultimaEntrada.delete(k)
+  }
+}
+function esRespuestaAutomatica(uuid, m) {
+  const ahora = Date.now()
+  return [m.key.remoteJid, m.key.remoteJidAlt].some(
+    (j) => j && ahora - (ultimaEntrada.get(`${uuid}|${j}`) ?? 0) < AUTO_RESPUESTA_MS
+  )
+}
+
 /** El dueño escribió desde su celular: el asistente se aparta con ese cliente. */
 async function mensajeDelDueno(uuid, sock, m, leido) {
-  if (esDelBot(uuid, leido?.texto ?? '')) return
+  // Sin contenido legible (avisos internos de WhatsApp: cifrado, mensajes
+  // temporales, reacciones, ediciones…) no es el dueño atendiendo.
+  if (!leido) {
+    const tipo = getContentType(normalizeMessageContent(m.message) || {}) || '?'
+    log(uuid, 'mensaje propio sin contenido ignorado:', tipo)
+    return
+  }
+  if (esDelBot(uuid, leido.texto ?? '')) return
+  // Bienvenida / ausencia automática de WhatsApp Business: se anota en la
+  // conversación, pero el asistente sigue atendiendo.
+  const automatico = esRespuestaAutomatica(uuid, m)
   try {
     const telefono = await telefonoDe(sock, m.key.remoteJid, m.key.remoteJidAlt)
-    await api.ownerMessage(uuid, telefono, leido?.texto || '')
-    log(uuid, 'el dueño respondió a mano: asistente en pausa con', telefono)
+    await api.ownerMessage(uuid, telefono, leido.texto || '', !automatico)
+    log(
+      uuid,
+      automatico
+        ? 'respuesta automática de WhatsApp Business (el asistente sigue) con'
+        : 'el dueño respondió a mano: asistente en pausa con',
+      telefono
+    )
   } catch (e) {
     log(uuid, 'no pude registrar mensaje del dueño', e.message)
   }
@@ -386,6 +424,7 @@ async function levantar(uuid) {
           await mensajeDelDueno(uuid, sock, m, leido)
           continue
         }
+        anotarEntrada(uuid, m)
         if (leido) encolarEntrante(uuid, m, leido)
       }
     })
