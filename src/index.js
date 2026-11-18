@@ -207,6 +207,26 @@ function encolarEntrante(uuid, m, leido) {
   }, AGRUPAR_MS)
 }
 
+const urlDe = (u) => (/^https?:\/\//.test(u) ? u : `${API_URL}${u}`)
+
+const MIMES = {
+  pdf: 'application/pdf',
+  doc: 'application/msword',
+  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+  xls: 'application/vnd.ms-excel',
+  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+  ppt: 'application/vnd.ms-powerpoint',
+  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+}
+const extDe = (n) => (String(n || '').match(/\.([a-z0-9]+)$/i)?.[1] || '').toLowerCase()
+const mimeDe = (nombre) => MIMES[extDe(nombre)] || 'application/octet-stream'
+/** El nombre que ve el cliente, con la extensión del archivo real. */
+function nombreArchivo(nombre, url) {
+  const ext = extDe(url) || 'pdf'
+  const base = String(nombre || 'Catalogo').trim() || 'Catalogo'
+  return extDe(base) === ext ? base : `${base}.${ext}`
+}
+
 async function atender(uuid, lote) {
   const entry = clients.get(uuid)
   if (!entry || entry.status !== 'connected') return
@@ -242,7 +262,11 @@ async function atender(uuid, lote) {
     }
 
     const r = await api.inbound(uuid, telefono, textos.join('\n'), noTexto?.kind || 'chat', imagenes)
-    const fotos = r?.media || []
+    const media = r?.media || []
+    // Las fotos que pidió el asistente llevan la respuesta; lo del saludo
+    // (catálogo en PDF, productos destacados) sale después del texto.
+    const fotos = media.filter((f) => !f.trasTexto && f.tipo !== 'documento')
+    const despues = media.filter((f) => f.trasTexto || f.tipo === 'documento')
     let reply = r?.reply || null
 
     if (reply) {
@@ -256,8 +280,7 @@ async function atender(uuid, lote) {
       const ultima = i === fotos.length - 1
       const juntar = ultima && reply && reply.length <= 1000
       try {
-        const url = /^https?:\/\//.test(f.url) ? f.url : `${API_URL}${f.url}`
-        await enviar(uuid, sock, jid, { image: { url }, caption: juntar ? reply : f.caption })
+        await enviar(uuid, sock, jid, { image: { url: urlDe(f.url) }, caption: juntar ? reply : f.caption })
         if (juntar) reply = null
         if (!ultima) await sleep(600 + Math.random() * 600)
       } catch (e) {
@@ -267,6 +290,24 @@ async function atender(uuid, lote) {
     }
 
     if (reply) await enviar(uuid, sock, jid, { text: reply })
+
+    for (const f of despues) {
+      await sleep(700 + Math.random() * 600)
+      try {
+        if (f.tipo === 'documento') {
+          const nombre = nombreArchivo(f.nombre, f.url)
+          await enviar(uuid, sock, jid, {
+            document: { url: urlDe(f.url) },
+            fileName: nombre,
+            mimetype: mimeDe(nombre),
+          })
+        } else {
+          await enviar(uuid, sock, jid, { image: { url: urlDe(f.url) }, caption: f.caption })
+        }
+      } catch (e) {
+        log(uuid, 'no pude enviar adjunto del saludo', e.message)
+      }
+    }
   } catch (e) {
     log(uuid, 'error al responder', e.message)
   } finally {
