@@ -128,6 +128,12 @@ function leerMensaje(m) {
     c.documentMessage?.caption ||
     ''
 
+  const leido = leerTipo(c, tipo, texto)
+  if (leido) leido.citado = leerCitado(c[tipo]?.contextInfo)
+  return leido
+}
+
+function leerTipo(c, tipo, texto) {
   switch (tipo) {
     case 'conversation':
     case 'extendedTextMessage':
@@ -177,9 +183,56 @@ function esDelBot(uuid, texto) {
   return i >= 0
 }
 
-async function enviar(uuid, sock, jid, contenido) {
+/**
+ * Qué era cada mensaje que mandó el bot (por id de WhatsApp). Cuando el
+ * cliente «responde» a una foto, WhatsApp solo trae el id y la descripción
+ * visible; y la descripción de la última foto es la respuesta del asistente,
+ * no el producto. Con esto se sabe de qué producto habla.
+ */
+const etiquetasEnviadas = new Map() // `${uuid}|${id}` -> texto
+const ETIQUETAS_MAX = 5000
+
+async function enviar(uuid, sock, jid, contenido, etiqueta = null) {
   anotarEnvio(uuid, contenido.text ?? contenido.caption ?? '')
-  return sock.sendMessage(jid, contenido)
+  const enviado = await sock.sendMessage(jid, contenido)
+  const id = enviado?.key?.id
+  if (id && etiqueta) {
+    etiquetasEnviadas.set(`${uuid}|${id}`, etiqueta)
+    if (etiquetasEnviadas.size > ETIQUETAS_MAX) etiquetasEnviadas.delete(etiquetasEnviadas.keys().next().value)
+  }
+  return enviado
+}
+
+/** El mensaje al que el cliente respondió (deslizar → «Responder»), si lo hay. */
+function leerCitado(info) {
+  const q = info?.quotedMessage
+  if (!q) return null
+  const c = normalizeMessageContent(q) || q
+  const tipo = getContentType(c)
+  const texto = (
+    c.conversation ||
+    c.extendedTextMessage?.text ||
+    c.imageMessage?.caption ||
+    c.videoMessage?.caption ||
+    c.documentMessage?.caption ||
+    c.documentMessage?.fileName ||
+    ''
+  ).trim()
+  return { id: info.stanzaId || null, foto: tipo === 'imageMessage', texto }
+}
+
+/** Texto que ve el asistente cuando el cliente responde a un mensaje concreto. */
+function describirCitado(uuid, citado) {
+  if (!citado) return ''
+  const propia = citado.id ? etiquetasEnviadas.get(`${uuid}|${citado.id}`) : null
+  const recorte = (t) => (t.length > 300 ? `${t.slice(0, 300)}…` : t)
+  if (propia) return `[El cliente responde a tu ${citado.foto ? 'foto' : 'mensaje'}: «${recorte(propia)}»]`
+  if (citado.foto) {
+    return citado.texto
+      ? `[El cliente responde a una foto con la descripción: «${recorte(citado.texto)}»]`
+      : '[El cliente responde a una foto (sin descripción)]'
+  }
+  return citado.texto ? `[El cliente responde al mensaje: «${recorte(citado.texto)}»]` : ''
 }
 
 // ---------------------------------------------------------------------------
@@ -233,7 +286,9 @@ async function atender(uuid, lote) {
   const { sock } = entry
   const ultimo = lote[lote.length - 1].m
   const jid = ultimo.key.remoteJid
-  const textos = lote.map((x) => x.texto.trim()).filter(Boolean)
+  const textos = lote
+    .map((x) => [describirCitado(uuid, x.citado), x.texto.trim()].filter(Boolean).join(' '))
+    .filter(Boolean)
   // Si alguno no es texto (foto, audio…), se avisa el tipo del último que no lo sea.
   const noTexto = [...lote].reverse().find((x) => x.kind !== 'chat')
 
@@ -280,7 +335,13 @@ async function atender(uuid, lote) {
       const ultima = i === fotos.length - 1
       const juntar = ultima && reply && reply.length <= 1000
       try {
-        await enviar(uuid, sock, jid, { image: { url: urlDe(f.url) }, caption: juntar ? reply : f.caption })
+        await enviar(
+          uuid,
+          sock,
+          jid,
+          { image: { url: urlDe(f.url) }, caption: juntar ? reply : f.caption },
+          f.caption || null
+        )
         if (juntar) reply = null
         if (!ultima) await sleep(600 + Math.random() * 600)
       } catch (e) {
@@ -289,7 +350,7 @@ async function atender(uuid, lote) {
       }
     }
 
-    if (reply) await enviar(uuid, sock, jid, { text: reply })
+    if (reply) await enviar(uuid, sock, jid, { text: reply }, reply)
 
     for (const f of despues) {
       await sleep(700 + Math.random() * 600)
@@ -302,7 +363,7 @@ async function atender(uuid, lote) {
             mimetype: mimeDe(nombre),
           })
         } else {
-          await enviar(uuid, sock, jid, { image: { url: urlDe(f.url) }, caption: f.caption })
+          await enviar(uuid, sock, jid, { image: { url: urlDe(f.url) }, caption: f.caption }, f.caption || null)
         }
       } catch (e) {
         log(uuid, 'no pude enviar adjunto del saludo', e.message)
